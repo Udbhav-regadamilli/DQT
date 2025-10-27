@@ -1,3 +1,4 @@
+// App.jsx
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Row,
@@ -16,20 +17,37 @@ import ReactFlow, {
 import "reactflow/dist/style.css";
 import "bootstrap/dist/css/bootstrap.min.css";
 
+/**
+ * Requirements:
+ * npm install reactflow react-bootstrap bootstrap
+ *
+ * This file provides:
+ * - JSON formatter (left)
+ * - JSON visualizer (right) with React Flow
+ * - Hierarchical dragging: moving a parent moves its descendants
+ */
+
 function App() {
   const [jsonInput, setJsonInput] = useState("");
   const [formattedJson, setFormattedJson] = useState("");
   const [error, setError] = useState("");
-  const [mode, setMode] = useState("format");
+  const [mode, setMode] = useState("format"); // "format" | "visualize"
 
-  // ✅ useNodesState and useEdgesState instead of useState
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
 
   const textareaRef = useRef(null);
   const idCounter = useRef(1);
 
+  // parentMap: { parentIdString: [ childIdString, ... ], ... }
+  const parentMap = useRef({});
+
+  // positions snapshot of subtree at drag start:
+  // { nodeId: { x, y }, descendantId: {x,y}, ... }
+  const dragSnapshot = useRef({});
+
   useEffect(() => {
+    // auto-resize text area
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
       textareaRef.current.style.height =
@@ -41,6 +59,7 @@ function App() {
       setError("");
       setNodes([]);
       setEdges([]);
+      parentMap.current = {};
       return;
     }
 
@@ -54,29 +73,39 @@ function App() {
       setError("Invalid JSON!");
       setNodes([]);
       setEdges([]);
+      parentMap.current = {};
     }
   }, [jsonInput, mode]);
 
+  // Build nodes/edges and parentMap (consistent string IDs)
   const generateFlow = useCallback(
     (obj) => {
       const newNodes = [];
       const newEdges = [];
+      const relations = {}; // temporary map parent->children (strings)
       idCounter.current = 1;
 
-      const traverse = (obj, depth = 0, parentId = null, parentY = 0) => {
-        const currentId = idCounter.current++;
-        const yOffset = currentId * 80;
+      // helper to create a fresh id string
+      const nextId = () => {
+        const id = String(idCounter.current++);
+        return id;
+      };
+
+      // recursive generator with horizontal tree layout
+      const traverse = (node, depth = 0, centerX = 0, parentId = null) => {
+        const currentId = nextId();
+        const y = depth * 120;
+        const label =
+          typeof node === "object"
+            ? Array.isArray(node)
+              ? "Array"
+              : "Object"
+            : String(node);
 
         newNodes.push({
-          id: String(currentId),
-          data: {
-            label: Array.isArray(obj)
-              ? "Array"
-              : typeof obj === "object"
-              ? "Object"
-              : String(obj),
-          },
-          position: { x: depth * 250, y: parentY + yOffset },
+          id: currentId,
+          data: { label },
+          position: { x: centerX, y },
           draggable: true,
           style: {
             padding: 10,
@@ -91,22 +120,34 @@ function App() {
         if (parentId) {
           newEdges.push({
             id: `e${parentId}-${currentId}`,
-            source: String(parentId),
-            target: String(currentId),
+            source: parentId,
+            target: currentId,
           });
+
+          relations[parentId] = relations[parentId] || [];
+          relations[parentId].push(currentId);
         }
 
-        if (typeof obj === "object" && obj !== null) {
-          Object.entries(obj).forEach(([key, val]) => {
-            const childId = idCounter.current++;
-            const childY = yOffset + childId * 60;
+        // if node has children (object/array), layout children evenly below
+        if (typeof node === "object" && node !== null) {
+          const entries = Object.entries(node);
+          const childCount = entries.length;
+          // width per child (tweak as desired)
+          const spacing = 220;
+          const totalWidth = childCount * spacing;
+          const startX = centerX - totalWidth / 2 + spacing / 2;
 
+          entries.forEach(([key, val], i) => {
+            const childX = startX + i * spacing;
+            const childId = nextId();
+            const childLabel =
+              typeof val === "object" ? `${key}` : `${key}: ${String(val)}`;
+
+            // child node
             newNodes.push({
-              id: String(childId),
-              data: {
-                label: `${key}: ${typeof val === "object" ? "" : String(val)}`,
-              },
-              position: { x: (depth + 1) * 250, y: parentY + childY },
+              id: childId,
+              data: { label: childLabel },
+              position: { x: childX, y: y + 120 },
               draggable: true,
               style: {
                 padding: 10,
@@ -120,23 +161,108 @@ function App() {
 
             newEdges.push({
               id: `e${currentId}-${childId}`,
-              source: String(currentId),
-              target: String(childId),
+              source: currentId,
+              target: childId,
             });
 
+            relations[currentId] = relations[currentId] || [];
+            relations[currentId].push(childId);
+
+            // recurse into child value (deeper sub-children)
             if (typeof val === "object" && val !== null) {
-              traverse(val, depth + 2, childId, parentY + childY);
+              // place deeper subtree centered at this childX
+              traverse(val, depth + 2, childX, childId);
             }
           });
         }
       };
 
-      traverse(obj);
+      // start traversal from root object centered at x=0
+      traverse(obj, 0, 0, null);
+
+      // commit nodes/edges and relations
       setNodes(newNodes);
       setEdges(newEdges);
+      parentMap.current = relations;
     },
     [setNodes, setEdges]
   );
+
+  // Utility: collect all descendant ids of a parent (recursive)
+  const collectDescendants = (parentId) => {
+    const collected = [];
+    const stack = parentMap.current[parentId]
+      ? [...parentMap.current[parentId]]
+      : [];
+    while (stack.length) {
+      const child = stack.shift();
+      collected.push(child);
+      const children = parentMap.current[child];
+      if (children && children.length) stack.push(...children);
+    }
+    return collected;
+  };
+
+  // onNodeDragStart -> snapshot positions (parent + entire subtree)
+  const onNodeDragStart = (_, node) => {
+    const nodeId = node.id;
+    const descendants = collectDescendants(nodeId);
+    const snapshot = {};
+    // include the node itself
+    snapshot[nodeId] = { x: node.position.x, y: node.position.y };
+    // capture positions of current nodes from nodes state
+    const nodeMap = {};
+    nodes.forEach((n) => {
+      nodeMap[n.id] = n.position;
+    });
+    for (const d of descendants) {
+      if (nodeMap[d]) {
+        snapshot[d] = { x: nodeMap[d].x, y: nodeMap[d].y };
+      } else {
+        // if missing in nodes for some reason, set from node object
+        snapshot[d] = { x: node.position.x, y: node.position.y + 40 };
+      }
+    }
+    dragSnapshot.current[nodeId] = snapshot;
+  };
+
+  // onNodeDrag -> compute delta relative to snapshot and move descendants
+  const onNodeDrag = (_, node) => {
+    const nodeId = node.id;
+    const snapshot = dragSnapshot.current[nodeId];
+    if (!snapshot) return;
+
+    const startPos = snapshot[nodeId];
+    const dx = node.position.x - startPos.x;
+    const dy = node.position.y - startPos.y;
+
+    // update positions of descendants relative to snapshot
+    const descendants = Object.keys(snapshot).filter((id) => id !== nodeId);
+
+    if (descendants.length === 0) return; // no children
+
+    setNodes((nds) =>
+      nds.map((n) => {
+        if (snapshot[n.id]) {
+          // new position = original snapshot position + (dx,dy)
+          return {
+            ...n,
+            position: {
+              x: snapshot[n.id].x + dx,
+              y: snapshot[n.id].y + dy,
+            },
+          };
+        }
+        return n;
+      })
+    );
+  };
+
+  // Clean snapshot on drag stop
+  const onNodeDragStop = (_, node) => {
+    const nodeId = node.id;
+    delete dragSnapshot.current[nodeId];
+  };
 
   const handleCopy = () => {
     if (formattedJson) {
@@ -170,7 +296,7 @@ function App() {
       </div>
 
       <Row className="h-100" style={{ minHeight: "70vh" }}>
-        {/* Input JSON */}
+        {/* left: input */}
         <Col md={6} className="d-flex flex-column">
           <h4>Input JSON</h4>
           <textarea
@@ -183,7 +309,7 @@ function App() {
           {error && <p className="text-danger mt-2">{error}</p>}
         </Col>
 
-        {/* Output / Visualization */}
+        {/* right: formatted or visualizer */}
         <Col md={6} className="d-flex flex-column">
           {mode === "format" ? (
             <>
@@ -215,9 +341,12 @@ function App() {
                 onEdgesChange={onEdgesChange}
                 fitView
                 nodesDraggable
-                nodesConnectable={true}
+                nodesConnectable={false}
                 panOnDrag
                 zoomOnScroll
+                onNodeDragStart={onNodeDragStart}
+                onNodeDrag={onNodeDrag}
+                onNodeDragStop={onNodeDragStop}
               >
                 <Background />
                 <Controls />
